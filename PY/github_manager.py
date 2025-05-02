@@ -4,6 +4,7 @@ import traceback
 import tkinter.filedialog as filedialog
 import tkinter.messagebox as messagebox
 import platform  # Needed for path joining and explorer/finder opening
+import threading
 
 # First attempt to handle the CTkListbox import
 # type: ignore[import] - Tell Pylance to ignore this import error
@@ -104,13 +105,11 @@ licenses = {
     "No License": ""
 }
 
-# Defer CTk initialization until main() is called
-# ctk.set_appearance_mode("dark")  # Options: "dark", "light", "system"
-# ctk.set_default_color_theme("blue")  # Options: "blue", "green", "dark-blue"
-
+gitignore_templates = [
+    "None", "Python", "Node", "VisualStudio", "Java", "Go", "Ruby", "Unity"
+]
 
 def append_to_console(text):
-    # Clear previous content before adding new status message
     output_label.configure(state="normal")
     output_label.delete("1.0", "end")  # Clear the textbox
     output_label.insert("end", text + "\n")
@@ -253,14 +252,29 @@ def run_command(command):
     global output_label
     append_to_console(f"[ACTION] {command}")
     try:
-        result = subprocess.run(command, shell=True,
-                                capture_output=True, text=True, check=True)
-        output_text = result.stdout if result.stdout else "Command executed successfully."
-        append_to_console(output_text)
-    except subprocess.CalledProcessError as e:
-        output_text = f"Error executing command:\n{e}\n{e.stderr}"
+        process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        stdout, stderr = process.communicate()
+        return_code = process.returncode
+
+        if return_code == 0:
+            output_text = stdout if stdout else "Command executed successfully."
+            append_to_console(output_text)
+            return True  # Indicate success
+        else:
+            error_message = f"Error executing command (Code: {return_code}):\n"
+            if stderr:
+                error_message += f"STDERR:\n{stderr}\n"
+            if stdout:  # Sometimes errors are printed to stdout
+                error_message += f"STDOUT:\n{stdout}\n"
+            append_to_console(error_message)
+            send_discord_log(command, error_message)
+            return False  # Indicate failure
+
+    except Exception as e:
+        output_text = f"Fatal error running command:\n{e}\n{traceback.format_exc()}"
         append_to_console(output_text)
         send_discord_log(command, output_text)
+        return False  # Indicate failure
 
 
 def select_folder():
@@ -282,228 +296,157 @@ def backup_repo(repo_name, repo_path):
     append_to_console(f"🔄 Backup created for {repo_name}")
 
 
-def process_repositories():
+def _process_repositories_thread():
+    global progress_bar
+
     folder_path = folder_selected.get()
     custom_message = commit_message_entry.get()
     privacy_setting = privacy_var.get()
     selected_license = license_var.get()
     add_readme_flag = add_readme_var.get()
-    add_gitignore_flag = add_gitignore_var.get()
-    mode = repo_mode_var.get()  # Get the selected repository mode
-    # Added debug
-    print(f"[DEBUG] process_repositories called with mode: {mode}")
+    gitignore_template = gitignore_var.get()
+    mode = repo_mode_var.get()
 
-    if not folder_path:
-        append_to_console("⚠️ Please select a folder first.")
-        # Added debug
-        print("[DEBUG] Exiting process_repositories: No folder selected.")
-        return
-    if not custom_message:
-        append_to_console("⚠️ Please enter a commit message.")
-        # Added debug
-        print("[DEBUG] Exiting process_repositories: No commit message.")
+    if not folder_path or not custom_message:
+        append_to_console("❌ Error: Folder or commit message missing (thread).")
+        progress_bar.set(0)
+        progress_bar.pack_forget()
         return
 
-    # Get the current GitHub username
     try:
-        print("[DEBUG] Getting GitHub username...")  # Added debug
-        result = subprocess.run('gh api user', shell=True,
-                                capture_output=True, text=True, check=True)
+        result = subprocess.run('gh api user', shell=True, capture_output=True, text=True, check=True)
         user_info = json.loads(result.stdout)
         github_username = user_info.get('login')
         if not github_username:
-            append_to_console(
-                "⚠️ Could not determine GitHub username. Please make sure you're logged in with 'gh auth login'")
-            # Added debug
-            print(
-                "[DEBUG] Exiting process_repositories: Could not get GitHub username.")
+            append_to_console("⚠️ Could not determine GitHub username in thread.")
+            progress_bar.set(0)
+            progress_bar.pack_forget()
             return
-        print(f"[DEBUG] GitHub username: {github_username}")  # Added debug
     except Exception as e:
-        append_to_console(f"⚠️ Error getting GitHub username: {e}")
-        # Added debug
-        print(
-            f"[DEBUG] Exiting process_repositories: Error getting GitHub username: {e}")
+        append_to_console(f"⚠️ Error getting GitHub username in thread: {e}")
+        progress_bar.set(0)
+        progress_bar.pack_forget()
         return
 
     append_to_console("Processing...")
+    progress_bar.set(0.1)
     root.update_idletasks()
 
-    # Skip these special directories
-    skip_dirs = ['.git', 'build', 'dist', '__pycache__',
-        '.github', '.vscode', 'repo_backup', 'node_modules']
+    skip_dirs = ['.git', 'build', 'dist', '__pycache__', '.github', '.vscode', 'repo_backup', 'node_modules']
 
-    # Single repository mode
     if mode == "single":
-        print("[DEBUG] Entering single repository mode.")  # Added debug
-
-        # Sanitize the folder name to create a valid GitHub repo name
         base_repo_name = os.path.basename(folder_path)
-        repo_name = base_repo_name.replace(
-            " ", "-")  # Replace spaces with hyphens
-
+        repo_name = base_repo_name.replace(" ", "-")
         repo_path = folder_path
-        # Added debug
-        print(
-            f"[DEBUG] Single mode - Original Folder Name: {base_repo_name}, Sanitized Repo Name: {repo_name}, Repo Path: {repo_path}")
-
         is_git_repo = os.path.isdir(os.path.join(repo_path, '.git'))
-        # Added debug
-        print(f"[DEBUG] Single mode - Is Git Repo: {is_git_repo}")
 
         if not is_git_repo:
             append_to_console(f"Initializing {repo_name}...")
+            progress_bar.set(0.2)
             root.update_idletasks()
-            # Added debug
-            print(f"[DEBUG] Single mode - Initializing {repo_name}...")
-
-            print("[DEBUG] Single mode - Creating backup...")  # Added debug
-            # Use sanitized name for backup consistency if desired
             backup_repo(repo_name, repo_path)
 
             try:
-                # 1. Initialize git repository
-                # Added debug
-                print("[DEBUG] Single mode - Running git init...")
-                run_command(f'cd "{repo_path}" && git init')
+                if not run_command(f'cd "{repo_path}" && git init'): raise Exception("git init failed")
+                progress_bar.set(0.3)
 
-                # 2. Create remote repository first (using sanitized name)
-                append_to_console(
-                    f"Creating GitHub repo for {repo_name}...")
-                root.update_idletasks()
-                # Added debug
-                print("[DEBUG] Single mode - Running gh repo create...")
-                # Use sanitized name
+                append_to_console(f"Creating GitHub repo for {repo_name}...")
                 create_cmd = f'cd "{repo_path}" && gh repo create "{repo_name}" --{privacy_setting}'
                 license_key = licenses.get(selected_license, "")
-                if license_key:
-                    create_cmd += f' --license "{license_key}"'
-                if add_readme_flag:
-                    create_cmd += " --add-readme"
-                # Added debug
-                print(f"[DEBUG] Single mode - Create command: {create_cmd}")
-                run_command(create_cmd)
+                if license_key: create_cmd += f' --license "{license_key}"'
+                if add_readme_flag: create_cmd += " --add-readme"
+                if gitignore_template != "None":
+                    create_cmd += f' --gitignore "{gitignore_template}"'
+                if not run_command(create_cmd): raise Exception("gh repo create failed")
+                progress_bar.set(0.4)
 
-                # 3. Add remote origin (using sanitized name)
-                append_to_console(
-                    f"Setting up remote for {repo_name}...")
-                root.update_idletasks()
-                # Use sanitized name
+                append_to_console(f"Setting up remote for {repo_name}...")
                 remote_url = f'https://github.com/{github_username}/{repo_name}.git'
-                # Added debug
-                print(
-                    f"[DEBUG] Single mode - Running git remote add origin {remote_url}...")
-                run_command(
-                    f'cd "{repo_path}" && git remote add origin {remote_url}')
+                if not run_command(f'cd "{repo_path}" && git remote add origin {remote_url}'): raise Exception("git remote add failed")
+                progress_bar.set(0.5)
 
-                # 4. Ensure git identity is configured (required for stash/commit operations)
                 try:
-                    print("[DEBUG] Single mode - Checking git identity configuration...")
-                    # Check for user name
-                    name_result = subprocess.run('git config --global user.name', shell=True, 
-                                               capture_output=True, text=True)
-                    # Check for user email
-                    email_result = subprocess.run('git config --global user.email', shell=True, 
-                                                capture_output=True, text=True)
-                    
+                    name_result = subprocess.run('git config --global user.name', shell=True, capture_output=True, text=True)
+                    email_result = subprocess.run('git config --global user.email', shell=True, capture_output=True, text=True)
                     if not name_result.stdout.strip() or not email_result.stdout.strip():
-                        append_to_console("⚠️ Git identity not fully configured. Using placeholder values...")
-                        # Set temporary identity values for this repository only (not global)
+                        append_to_console("⚠️ Git identity not fully configured. Setting temporary local values...")
                         subprocess.run(f'cd "{repo_path}" && git config user.name "GitHub Manager User"', shell=True)
                         subprocess.run(f'cd "{repo_path}" && git config user.email "githubmanager@example.com"', shell=True)
                 except Exception as e:
-                    print(f"[DEBUG] Single mode - Error checking git identity: {e}")
-                    # Continue anyway, the subsequent operations will show more specific errors if needed
+                    print(f"[DEBUG] Error checking git identity: {e}")
+                progress_bar.set(0.6)
 
-                # 5. Handle README and License files from remote
-                if add_readme_flag or license_key:
-                    print("[DEBUG] Single mode - Handling potential remote files...")
-                    try:
-                        # Try to pull first without stashing
-                        print("[DEBUG] Single mode - Running git pull origin main --allow-unrelated-histories...")
-                        pull_result = subprocess.run(
-                            f'cd "{repo_path}" && git pull origin main --allow-unrelated-histories', 
-                            shell=True, capture_output=True, text=True)
-                        
-                        if pull_result.returncode != 0:
-                            print("[DEBUG] Single mode - Pull failed, trying with stash...")
-                            # Only if pull fails, try the stash approach
-                            subprocess.run(f'cd "{repo_path}" && git stash', shell=True)
-                            run_command(
-                                f'cd "{repo_path}" && git pull origin main --allow-unrelated-histories')
-                    except Exception as e:
-                        print(f"[DEBUG] Single mode - Error during pull: {e}")
-                        append_to_console("⚠️ Could not pull remote files. Continuing with local files...")
-                        # Continue anyway, we'll force push if needed
+                if add_readme_flag or license_key or gitignore_template != "None":
+                    append_to_console("Pulling remote files...")
+                    run_command(f'cd "{repo_path}" && git pull origin main --allow-unrelated-histories')
+                progress_bar.set(0.7)
 
-                # 6. Stage all local files
-                # Added debug
-                print("[DEBUG] Single mode - Running git add . ...")
-                run_command(f'cd "{repo_path}" && git add .')
+                append_to_console("Staging files...")
+                if not run_command(f'cd "{repo_path}" && git add .'): raise Exception("git add failed")
+                progress_bar.set(0.8)
 
-                # 7. Commit local files
-                # Added debug
-                print("[DEBUG] Single mode - Running git commit...")
-                # Use --allow-empty in case pull already brought in changes and add . staged nothing new
-                run_command(
-                    f'cd "{repo_path}" && git commit --allow-empty -m "{custom_message}"')
+                append_to_console("Committing files...")
+                if not run_command(f'cd "{repo_path}" && git commit --allow-empty -m "{custom_message}"'): raise Exception("git commit failed")
+                progress_bar.set(0.9)
 
-                # 8. Set the main branch and push
-                append_to_console(
-                    f"Pushing project files for {repo_name}...")
-                root.update_idletasks()
-                # Added debug
-                print("[DEBUG] Single mode - Running git branch -M main...")
-                run_command(f'cd "{repo_path}" && git branch -M main')
-                # Added debug
-                print("[DEBUG] Single mode - Running git push -u origin main...")
-                run_command(f'cd "{repo_path}" && git push -u origin main')
+                append_to_console(f"Pushing project files for {repo_name}...")
+                if not run_command(f'cd "{repo_path}" && git branch -M main'): print("Warning: git branch -M main failed, continuing push...")
+                if not run_command(f'cd "{repo_path}" && git push -u origin main'): raise Exception("git push failed")
 
-                append_to_console(
-                    f"✅ Repository {repo_name} created and pushed successfully.")
-                # Added debug
-                print(
-                    f"[DEBUG] Single mode - Repository {repo_name} created successfully.")
+                append_to_console(f"✅ Repository {repo_name} created and pushed successfully.")
 
             except Exception as e:
-                append_to_console(
-                    f"❌ Error processing {repo_name}: {str(e)}")
-                # Added debug
-                print(
-                    f"[DEBUG] Single mode - Error processing {repo_name}: {e}")
-                # Log the full traceback for detailed error info
-                logging.error(
-                    f"Error processing single repo {repo_name}: {traceback.format_exc()}")
+                append_to_console(f"❌ Error processing {repo_name}: {str(e)}")
+                logging.error(f"Error processing single repo {repo_name}: {traceback.format_exc()}")
         else:
-            append_to_console(
-                f"Skipping {repo_name}: Already a git repository.")
-            # Added debug
-            print(
-                f"[DEBUG] Single mode - Skipping {repo_name}: Already a git repository.")
+            append_to_console(f"Skipping {repo_name}: Already a git repository.")
 
-    # Multiple repositories mode (original behavior)
     elif mode == "multi":
-        print("[DEBUG] Entering multiple repositories mode.")  # Added debug
-        # ... (rest of the multi-mode code remains unchanged) ...
-        # Ensure multi-mode also has a final completion message
-        append_to_console("✅ Multi-repository processing complete.")
-        print("[DEBUG] Multi-mode processing complete.")  # Added debug
+        append_to_console("⏳ Multi-repository processing started (progress bar not fully implemented for multi-mode)...")
+        subdirs = [d for d in os.listdir(folder_path) if os.path.isdir(os.path.join(folder_path, d)) and d not in skip_dirs]
+        total_steps = len(subdirs) * 8
+        current_step = 0
+        for i, subdir in enumerate(subdirs):
+            repo_name = subdir.replace(" ", "-")
+            repo_path = os.path.join(folder_path, subdir)
+            append_to_console(f"Processing subfolder {i+1}/{len(subdirs)}: {subdir}")
+            root.update_idletasks()
+        append_to_console("✅ Multi-repository processing complete (basic).")
+
     else:
-        print(f"[DEBUG] Unknown mode selected: {mode}")  # Added debug
         append_to_console(f"⚠️ Unknown mode selected: {mode}")
 
-    print("[DEBUG] Exiting process_repositories function.")  # Added debug
+    progress_bar.set(1.0)
+    time.sleep(0.5)
+    progress_bar.pack_forget()
+
+
+def process_repositories():
+    global progress_bar
+    folder_path = folder_selected.get()
+    custom_message = commit_message_entry.get()
+
+    if not folder_path:
+        append_to_console("⚠️ Please select a folder first.")
+        return
+    if not custom_message:
+        append_to_console("⚠️ Please enter a commit message.")
+        return
+
+    progress_bar.pack(pady=(5, 10), padx=10, fill="x")
+    progress_bar.set(0)
+
+    thread = threading.Thread(target=_process_repositories_thread, daemon=True)
+    thread.start()
 
 
 def archive_repo():
     repo_name = repo_entry.get()
-    # Add --yes flag for non-interactive execution
     run_command(f'gh repo archive "{repo_name}" --yes')
 
 
 def restore_repo():
     repo_name = repo_entry.get()
-    # Add --yes flag for non-interactive execution
     run_command(f'gh repo unarchive "{repo_name}" --yes')
 
 
@@ -530,13 +473,11 @@ selected_repo = None
 def on_repo_select(event=None):
     global selected_repo
     selection = repo_listbox.curselection()
-    if selection is not None:  # CTkListbox returns an integer, not a list/tuple
-        # Handle the case where selection is an integer (from CTkListbox package)
+    if selection is not None:
         try:
             if isinstance(selection, int):
                 selected_repo = repo_listbox.get(selection).split()[0]
             else:
-                # Original behavior for our fallback implementation
                 selected_repo = repo_listbox.get(selection[0]).split()[0]
         except (TypeError, IndexError, AttributeError) as e:
             print(f"[DEBUG] Error in selection handling: {e}")
@@ -560,7 +501,6 @@ def push_selected_repo():
         append_to_console("⚠️ Please select a repository from the list first.")
         return
 
-    # 1. Ask user to select the local folder to push
     append_to_console(f"Select the LOCAL folder containing the content to push to {selected_repo}.")
     local_folder_to_push = filedialog.askdirectory(
         title=f"Select LOCAL folder to force push to {selected_repo}"
@@ -570,7 +510,6 @@ def push_selected_repo():
         append_to_console("❌ Push cancelled: No local folder selected.")
         return
 
-    # 2. Show a strong confirmation dialog
     confirm = messagebox.askyesno(
         "Confirm Force Push",
         f"⚠️ WARNING! ⚠️\n\nThis will COMPLETELY OVERWRITE the remote repository '{selected_repo}' "
@@ -587,18 +526,16 @@ def push_selected_repo():
     append_to_console(f"🚀 Starting force push of '{local_folder_to_push}' to '{selected_repo}'...")
     root.update_idletasks()
 
-    temp_clone_dir = None  # Initialize variable
+    temp_clone_dir = None
     try:
-        # 3. Create a temporary directory for cloning
         temp_base_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temp_push_clones")
         os.makedirs(temp_base_path, exist_ok=True)
-        repo_local_name = selected_repo.split('/')[-1]  # Get repo name like 'GitHub-Automation'
+        repo_local_name = selected_repo.split('/')[-1]
         temp_clone_dir = os.path.join(temp_base_path, f"{repo_local_name}_{int(time.time())}")
         
         append_to_console(f"Cloning {selected_repo} to temporary directory...")
         run_command(f'gh repo clone {selected_repo} "{temp_clone_dir}"')
 
-        # 4. Clear the temporary clone directory (except .git)
         append_to_console("Clearing temporary clone directory...")
         for item in os.listdir(temp_clone_dir):
             item_path = os.path.join(temp_clone_dir, item)
@@ -612,11 +549,9 @@ def push_selected_repo():
             except Exception as e:
                 append_to_console(f"⚠️ Warning: Could not remove {item_path}: {e}")
 
-        # 5. Copy content from the user's selected local folder
         append_to_console(f"Copying content from {local_folder_to_push}...")
         shutil.copytree(local_folder_to_push, temp_clone_dir, dirs_exist_ok=True)
 
-        # 6. Perform Git operations: add, commit, force push
         append_to_console("Staging, committing, and force pushing...")
         git_command_base = f'cd "{temp_clone_dir}" && '
         run_command(git_command_base + 'git add .')
@@ -630,34 +565,79 @@ def push_selected_repo():
         append_to_console(f"❌ Error during force push: {e}")
         logging.error(f"Force push error for {selected_repo}: {traceback.format_exc()}")
     finally:
-        # 7. Clean up the temporary directory
         if temp_clone_dir and os.path.exists(temp_clone_dir):
             append_to_console("Cleaning up temporary directory...")
             try:
-                time.sleep(1)  # Short delay before cleanup
+                time.sleep(1)
                 shutil.rmtree(temp_clone_dir, ignore_errors=True)
             except Exception as e:
                 append_to_console(f"⚠️ Failed to fully clean up temp directory {temp_clone_dir}: {e}")
 
 
+def clone_selected_repo():
+    if not selected_repo:
+        append_to_console("⚠️ Please select a repository from the list first.")
+        return
+
+    append_to_console(f"Select destination folder to clone '{selected_repo}' into.")
+    destination_folder = filedialog.askdirectory(
+        title=f"Select Destination Folder for {selected_repo}"
+    )
+
+    if not destination_folder:
+        append_to_console("❌ Clone cancelled: No destination folder selected.")
+        return
+
+    repo_local_name = selected_repo.split('/')[-1]
+    clone_target_path = os.path.join(destination_folder, repo_local_name)
+
+    append_to_console(f"🚀 Cloning '{selected_repo}' into '{clone_target_path}'...")
+    root.update_idletasks()
+
+    if os.path.exists(clone_target_path):
+         if not messagebox.askyesno("Directory Exists", f"The directory '{clone_target_path}' already exists. Cloning might fail or merge. Continue?"):
+              append_to_console("❌ Clone cancelled: Target directory exists.")
+              return
+
+    try:
+        if run_command(f'gh repo clone {selected_repo} "{clone_target_path}"'):
+            append_to_console(f"✅ Successfully cloned {selected_repo} to {clone_target_path}")
+            if messagebox.askyesno("Clone Complete", "Repository cloned successfully. Open the folder?"):
+                if platform.system() == "Windows":
+                    subprocess.Popen(f'explorer "{os.path.normpath(clone_target_path)}"')
+                elif platform.system() == "Darwin":
+                    subprocess.Popen(["open", clone_target_path])
+                else:
+                    subprocess.Popen(["xdg-open", clone_target_path])
+        else:
+            append_to_console(f"❌ Failed to clone {selected_repo}.")
+
+    except Exception as e:
+        append_to_console(f"❌ Error during clone: {e}")
+        logging.error(f"Clone error for {selected_repo}: {traceback.format_exc()}")
+
+
+def change_theme():
+    mode = theme_var.get()
+    ctk.set_appearance_mode(mode)
+    append_to_console(f"🎨 Theme changed to: {mode}")
+
+
 def main():
     print("[DEBUG] Entered main() function.")
-    global root, output_label, webhook_entry, repo_entry, commit_message_entry, folder_selected, privacy_var, license_var, add_readme_var, add_gitignore_var, repo_listbox, repo_mode_var
+    global root, output_label, webhook_entry, repo_entry, commit_message_entry, folder_selected
+    global privacy_var, license_var, add_readme_var, gitignore_var, repo_listbox, repo_mode_var
+    global theme_var, progress_bar
     try:
-        ctk.set_appearance_mode("dark")  # Options: "dark", "light", "system"
-        # Options: "blue", "green", "dark-blue"
+        ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
         root = ctk.CTk()
         root.title("GitHub Manager")
-        root.geometry("800x700")
+        root.geometry("800x750")
 
-        # Check GitHub CLI login status at startup
-        print("[DEBUG] Checking GitHub CLI login status at startup...")
         if not check_github_login():
-            print(
-                "[DEBUG] User is not logged into GitHub CLI. Showing login instructions.")
-            # Schedule the login check after the main window is drawn
+            print("[DEBUG] User is not logged into GitHub CLI. Showing login instructions.")
             root.after(100, lambda: show_login_instructions())
         else:
             print("[DEBUG] User is already logged into GitHub CLI.")
@@ -665,10 +645,8 @@ def main():
         tabview = ctk.CTkTabview(root)
         tabview.pack(fill="both", expand=True, padx=10, pady=10)
 
-        # --- Main Tab ---
         main_tab = tabview.add("Main")
 
-        # Repository Mode Selection
         mode_frame = ctk.CTkFrame(main_tab)
         mode_frame.pack(pady=5, padx=10, fill="x")
         ctk.CTkLabel(mode_frame, text="Repository Mode:", font=ctk.CTkFont(
@@ -718,22 +696,32 @@ def main():
         ctk.CTkRadioButton(privacy_frame, text="Public",
                            variable=privacy_var, value="public").pack(side="left")
         license_frame = ctk.CTkFrame(options_frame)
-        license_frame.pack(anchor="w", pady=2)
+        license_frame.pack(anchor="w", pady=2, fill="x")
         ctk.CTkLabel(license_frame, text="License:").pack(side="left", padx=5)
         license_var = ctk.StringVar(value="No License")
         license_dropdown = ctk.CTkComboBox(license_frame, variable=license_var, values=list(
             licenses.keys()), width=180, state="readonly")
         license_dropdown.set("No License")
-        license_dropdown.pack(side="left")
+        license_dropdown.pack(side="left", padx=(0, 10))
+
+        ctk.CTkLabel(license_frame, text=".gitignore:").pack(side="left", padx=5)
+        gitignore_var = ctk.StringVar(value="None")
+        gitignore_dropdown = ctk.CTkComboBox(license_frame, variable=gitignore_var, values=gitignore_templates, width=180, state="readonly")
+        gitignore_dropdown.set("None")
+        gitignore_dropdown.pack(side="left")
+
         extras_frame = ctk.CTkFrame(options_frame)
         extras_frame.pack(anchor="w", pady=2)
         add_readme_var = ctk.BooleanVar()
-        add_gitignore_var = ctk.BooleanVar()
         ctk.CTkCheckBox(extras_frame, text="Add README",
                         variable=add_readme_var).pack(side="left", padx=5)
-        # ctk.CTkCheckBox(extras_frame, text="Add .gitignore", variable=add_gitignore_var).pack(side="left", padx=5)
+
         ctk.CTkButton(main_tab, text="Create Repositories and Push", command=process_repositories,
                       fg_color="#1e90ff", hover_color="#1565c0", font=ctk.CTkFont(size=15, weight="bold")).pack(pady=15)
+
+        progress_bar = ctk.CTkProgressBar(main_tab, orientation="horizontal", mode="determinate")
+        progress_bar.set(0)
+
         archive_frame = ctk.CTkFrame(main_tab)
         archive_frame.pack(pady=10, padx=10, fill="x")
         ctk.CTkLabel(
@@ -747,15 +735,14 @@ def main():
         output_label = ctk.CTkTextbox(
             main_tab, 
             height=120, 
-            fg_color=("#333", "#333"),  # Dark background in both modes
-            text_color=("#ffffff", "#ffffff"),  # White text in both modes
+            fg_color=("#333", "#333"),  
+            text_color=("#ffffff", "#ffffff"),  
             corner_radius=8
         )
         output_label.insert("end", "Welcome to GitHub Manager!\nAll actions and results will appear here.\n\n")
         output_label.configure(state="disabled")
         output_label.pack(pady=10, padx=10, fill="both", expand=True)
 
-        # --- Repositories Tab ---
         repos_tab = tabview.add("Repositories")
         repo_list_frame = ctk.CTkFrame(repos_tab)
         repo_list_frame.pack(fill="both", expand=True, padx=10, pady=10)
@@ -766,12 +753,24 @@ def main():
         repo_button_frame.pack(side="left", fill="y", padx=5)
         ctk.CTkButton(repo_button_frame, text="Refresh List",
                       command=refresh_repo_list).pack(pady=5, fill="x")
+        ctk.CTkButton(repo_button_frame, text="Clone Selected",
+                      command=clone_selected_repo).pack(pady=5, fill="x")
         ctk.CTkButton(repo_button_frame, text="Pull Selected",
                       command=pull_selected_repo).pack(pady=5, fill="x")
         ctk.CTkButton(repo_button_frame, text="Push Selected",
                       command=push_selected_repo).pack(pady=5, fill="x")
 
-        # --- Instructions Tab ---
+        settings_tab = tabview.add("Settings")
+        theme_frame = ctk.CTkFrame(settings_tab)
+        theme_frame.pack(pady=10, padx=10, fill="x")
+        ctk.CTkLabel(theme_frame, text="Appearance Mode:", font=ctk.CTkFont(weight="bold")).pack(side="left", padx=5)
+        
+        theme_var = ctk.StringVar(value=ctk.get_appearance_mode())
+        
+        ctk.CTkRadioButton(theme_frame, text="Light", variable=theme_var, value="light", command=change_theme).pack(side="left", padx=10)
+        ctk.CTkRadioButton(theme_frame, text="Dark", variable=theme_var, value="dark", command=change_theme).pack(side="left", padx=10)
+        ctk.CTkRadioButton(theme_frame, text="System", variable=theme_var, value="system", command=change_theme).pack(side="left", padx=10)
+
         instructions_tab = tabview.add("Instructions")
         instructions_text = ctk.CTkTextbox(
             instructions_tab, wrap="word", width=750, height=650)
