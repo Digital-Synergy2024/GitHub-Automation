@@ -1,6 +1,9 @@
 import customtkinter as ctk  # type: ignore
 import sys
 import traceback
+import tkinter.filedialog as filedialog
+import tkinter.messagebox as messagebox
+import platform  # Needed for path joining and explorer/finder opening
 
 # First attempt to handle the CTkListbox import
 # type: ignore[import] - Tell Pylance to ignore this import error
@@ -393,33 +396,59 @@ def process_repositories():
                 run_command(
                     f'cd "{repo_path}" && git remote add origin {remote_url}')
 
-                # 4. Stash any potentially conflicting untracked files before pulling
+                # 4. Ensure git identity is configured (required for stash/commit operations)
+                try:
+                    print("[DEBUG] Single mode - Checking git identity configuration...")
+                    # Check for user name
+                    name_result = subprocess.run('git config --global user.name', shell=True, 
+                                               capture_output=True, text=True)
+                    # Check for user email
+                    email_result = subprocess.run('git config --global user.email', shell=True, 
+                                                capture_output=True, text=True)
+                    
+                    if not name_result.stdout.strip() or not email_result.stdout.strip():
+                        append_to_console("⚠️ Git identity not fully configured. Using placeholder values...")
+                        # Set temporary identity values for this repository only (not global)
+                        subprocess.run(f'cd "{repo_path}" && git config user.name "GitHub Manager User"', shell=True)
+                        subprocess.run(f'cd "{repo_path}" && git config user.email "githubmanager@example.com"', shell=True)
+                except Exception as e:
+                    print(f"[DEBUG] Single mode - Error checking git identity: {e}")
+                    # Continue anyway, the subsequent operations will show more specific errors if needed
+
+                # 5. Handle README and License files from remote
                 if add_readme_flag or license_key:
-                    # Added debug
-                    print("[DEBUG] Single mode - Running git stash push -u...")
-                    # Use --quiet to avoid unnecessary output unless there's an error
-                    run_command(f'cd "{repo_path}" && git stash push -u --quiet')
+                    print("[DEBUG] Single mode - Handling potential remote files...")
+                    try:
+                        # Try to pull first without stashing
+                        print("[DEBUG] Single mode - Running git pull origin main --allow-unrelated-histories...")
+                        pull_result = subprocess.run(
+                            f'cd "{repo_path}" && git pull origin main --allow-unrelated-histories', 
+                            shell=True, capture_output=True, text=True)
+                        
+                        if pull_result.returncode != 0:
+                            print("[DEBUG] Single mode - Pull failed, trying with stash...")
+                            # Only if pull fails, try the stash approach
+                            subprocess.run(f'cd "{repo_path}" && git stash', shell=True)
+                            run_command(
+                                f'cd "{repo_path}" && git pull origin main --allow-unrelated-histories')
+                    except Exception as e:
+                        print(f"[DEBUG] Single mode - Error during pull: {e}")
+                        append_to_console("⚠️ Could not pull remote files. Continuing with local files...")
+                        # Continue anyway, we'll force push if needed
 
-                    # Pull remote changes (README/License) if they exist
-                    # Added debug
-                    print(
-                        "[DEBUG] Single mode - Running git pull origin main --allow-unrelated-histories...")
-                    run_command(
-                        f'cd "{repo_path}" && git pull origin main --allow-unrelated-histories')
-
-                # 5. Stage all local files
+                # 6. Stage all local files
                 # Added debug
                 print("[DEBUG] Single mode - Running git add . ...")
                 run_command(f'cd "{repo_path}" && git add .')
 
-                # 6. Commit local files
+                # 7. Commit local files
                 # Added debug
                 print("[DEBUG] Single mode - Running git commit...")
                 # Use --allow-empty in case pull already brought in changes and add . staged nothing new
                 run_command(
                     f'cd "{repo_path}" && git commit --allow-empty -m "{custom_message}"')
 
-                # 7. Set the main branch and push
+                # 8. Set the main branch and push
                 append_to_console(
                     f"Pushing project files for {repo_name}...")
                 root.update_idletasks()
@@ -527,13 +556,88 @@ def pull_selected_repo():
 
 
 def push_selected_repo():
-    if selected_repo:
-        run_command(
-            f'gh repo clone {selected_repo} temp_repo && cd temp_repo && git push && cd .. && rmdir /s /q temp_repo')
-        append_to_console(f"Pushed latest for {selected_repo}")
-    else:
-        append_to_console(
-            "Please select a repository from the list.")
+    if not selected_repo:
+        append_to_console("⚠️ Please select a repository from the list first.")
+        return
+
+    # 1. Ask user to select the local folder to push
+    append_to_console(f"Select the LOCAL folder containing the content to push to {selected_repo}.")
+    local_folder_to_push = filedialog.askdirectory(
+        title=f"Select LOCAL folder to force push to {selected_repo}"
+    )
+
+    if not local_folder_to_push:
+        append_to_console("❌ Push cancelled: No local folder selected.")
+        return
+
+    # 2. Show a strong confirmation dialog
+    confirm = messagebox.askyesno(
+        "Confirm Force Push",
+        f"⚠️ WARNING! ⚠️\n\nThis will COMPLETELY OVERWRITE the remote repository '{selected_repo}' "
+        f"with the contents of the local folder:\n'{local_folder_to_push}'\n\n"
+        "All existing history and files on GitHub will be replaced.\n\n"
+        "Are you absolutely sure you want to proceed?",
+        icon='warning'
+    )
+
+    if not confirm:
+        append_to_console("❌ Force push cancelled by user.")
+        return
+
+    append_to_console(f"🚀 Starting force push of '{local_folder_to_push}' to '{selected_repo}'...")
+    root.update_idletasks()
+
+    temp_clone_dir = None  # Initialize variable
+    try:
+        # 3. Create a temporary directory for cloning
+        temp_base_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temp_push_clones")
+        os.makedirs(temp_base_path, exist_ok=True)
+        repo_local_name = selected_repo.split('/')[-1]  # Get repo name like 'GitHub-Automation'
+        temp_clone_dir = os.path.join(temp_base_path, f"{repo_local_name}_{int(time.time())}")
+        
+        append_to_console(f"Cloning {selected_repo} to temporary directory...")
+        run_command(f'gh repo clone {selected_repo} "{temp_clone_dir}"')
+
+        # 4. Clear the temporary clone directory (except .git)
+        append_to_console("Clearing temporary clone directory...")
+        for item in os.listdir(temp_clone_dir):
+            item_path = os.path.join(temp_clone_dir, item)
+            if item == '.git':
+                continue
+            try:
+                if os.path.isdir(item_path):
+                    shutil.rmtree(item_path)
+                else:
+                    os.remove(item_path)
+            except Exception as e:
+                append_to_console(f"⚠️ Warning: Could not remove {item_path}: {e}")
+
+        # 5. Copy content from the user's selected local folder
+        append_to_console(f"Copying content from {local_folder_to_push}...")
+        shutil.copytree(local_folder_to_push, temp_clone_dir, dirs_exist_ok=True)
+
+        # 6. Perform Git operations: add, commit, force push
+        append_to_console("Staging, committing, and force pushing...")
+        git_command_base = f'cd "{temp_clone_dir}" && '
+        run_command(git_command_base + 'git add .')
+        commit_message = f"Force push content from local folder via GitHub Manager"
+        run_command(git_command_base + f'git commit --allow-empty -m "{commit_message}"')
+        run_command(git_command_base + 'git push --force origin main') 
+
+        append_to_console(f"✅ Successfully force pushed local content to {selected_repo}.")
+
+    except Exception as e:
+        append_to_console(f"❌ Error during force push: {e}")
+        logging.error(f"Force push error for {selected_repo}: {traceback.format_exc()}")
+    finally:
+        # 7. Clean up the temporary directory
+        if temp_clone_dir and os.path.exists(temp_clone_dir):
+            append_to_console("Cleaning up temporary directory...")
+            try:
+                time.sleep(1)  # Short delay before cleanup
+                shutil.rmtree(temp_clone_dir, ignore_errors=True)
+            except Exception as e:
+                append_to_console(f"⚠️ Failed to fully clean up temp directory {temp_clone_dir}: {e}")
 
 
 def main():
@@ -640,7 +744,13 @@ def main():
                       fg_color="#ff7043", hover_color="#b71c1c").pack(side="left", padx=2)
         ctk.CTkButton(archive_frame, text="Restore", command=restore_repo,
                       fg_color="#66bb6a", hover_color="#1b5e20").pack(side="left", padx=2)
-        output_label = ctk.CTkTextbox(main_tab, height=120, fg_color=("#222", "#eee"), corner_radius=8)
+        output_label = ctk.CTkTextbox(
+            main_tab, 
+            height=120, 
+            fg_color=("#333", "#333"),  # Dark background in both modes
+            text_color=("#ffffff", "#ffffff"),  # White text in both modes
+            corner_radius=8
+        )
         output_label.insert("end", "Welcome to GitHub Manager!\nAll actions and results will appear here.\n\n")
         output_label.configure(state="disabled")
         output_label.pack(pady=10, padx=10, fill="both", expand=True)
