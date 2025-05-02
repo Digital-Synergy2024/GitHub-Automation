@@ -83,8 +83,6 @@ This tool is beneficial for:
 
 ## Screenshots
 
-*(Add screenshots of the application here)*
-
 *   *Main Tab Interface*
 
     ![GitHub Manager Screenshot](github_manager.png)
