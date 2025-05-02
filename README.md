@@ -86,9 +86,9 @@ This tool is beneficial for:
 *(Add screenshots of the application here)*
 
 *   *Main Tab Interface*
-    ```
-    [GitHub Manager Screenshot](github_manager.png)
-    ```
+
+    ![GitHub Manager Screenshot](github_manager.png)
+
 *   *Repositories Tab*
     ```
     [Image: Coming Soon!]
